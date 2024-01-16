@@ -223,9 +223,9 @@ def gaudi_mixtral_block_sparse_moe_forward(
     # One hot encode the selected experts to create an expert mask
     # this will be used to easily index which expert is going to be sollicitated
     # [num_experts, top_k, seq_len_padded]
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-    if token_idx is not None:
-        expert_mask[..., token_idx:] = 0
+    expert_mask = torch.nn.functional.one_hot(
+        selected_experts.to(torch.bfloat16), num_classes=self.num_experts
+    ).permute(2, 1, 0)
 
     # Loop over all available experts in the model and perform the computation on each expert
     for expert_idx in range(self.num_experts):
