@@ -63,8 +63,11 @@ except ImportError:
     print("Not using HPU fused scaled dot-product attention kernel.")
     FusedSDPA = None
 
+from deepspeed import comm as dist
 
 logger = logging.get_logger(__name__)
+
+import habana_frameworks.torch.core as htcore
 
 
 def apply_customized_rope(q, k, cos, sin, position_ids):
@@ -210,6 +213,11 @@ def gaudi_mixtral_block_sparse_moe_forward(
     # router_logits: (batch * sequence_length, n_experts)
     router_logits = self.gate(hidden_states)
 
+    if dist.is_initialized():
+        output_tensors = [router_logits.clone() for _ in range(dist.get_world_size())]
+        dist.all_gather(output_tensors, router_logits)
+        router_logits = torch.cat(output_tensors, dim=1)
+
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
@@ -229,6 +237,8 @@ def gaudi_mixtral_block_sparse_moe_forward(
 
     # Loop over all available experts in the model and perform the computation on each expert
     for expert_idx in range(self.num_experts):
+        # htcore.mark_step()
+        # htcore.hpu.current_stream().synchronize()
         expert_layer = self.experts[expert_idx]
 
         current_state_static = hidden_states.reshape(-1, hidden_dim)
@@ -239,6 +249,8 @@ def gaudi_mixtral_block_sparse_moe_forward(
         current_hidden_states_static_blanked = torch.sum(current_hidden_states_static_blanked, -1)
 
         final_hidden_states = final_hidden_states + current_hidden_states_static_blanked
+        # htcore.mark_step()
+        # htcore.hpu.current_stream().synchronize()
 
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     return final_hidden_states, router_logits
