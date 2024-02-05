@@ -154,6 +154,7 @@ def gaudi_mixtral_attn_forward(
         else:
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+    '''
     # repeat k/v heads if n_kv_heads < n_heads
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -184,6 +185,29 @@ def gaudi_mixtral_attn_forward(
             f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
             f" {attn_output.size()}"
         )
+    '''
+
+    query_states, key_states, value_states = \
+        query_states.unsqueeze(2), key_states.unsqueeze(2), value_states.unsqueeze(2)
+    query_states = query_states.reshape(bsz, self.num_key_value_heads,
+        self.num_key_value_groups, q_len, self.head_dim).contiguous()
+    key_states = key_states.reshape(bsz, self.num_key_value_heads,
+        1, kv_seq_len, self.head_dim).contiguous()
+    value_states = value_states.reshape(bsz, self.num_key_value_heads,
+        1, kv_seq_len, self.head_dim).contiguous()
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.unsqueeze(2)
+        attn_weights = attn_weights + attention_mask
+
+    # upcast attention to fp32
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    attn_output = attn_output.reshape(bsz, self.num_heads, q_len, self.head_dim).contiguous()
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
