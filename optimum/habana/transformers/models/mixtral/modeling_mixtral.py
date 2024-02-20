@@ -343,7 +343,7 @@ def gaudi_mixtral_decoder_layer_forward(
     # Fully Connected
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states, router_logits = self.block_sparse_moe(hidden_states, token_idx=token_idx)
+    hidden_states, router_logits = self.block_sparse_moe(hidden_states)
     hidden_states = residual + hidden_states
 
     outputs = (hidden_states,)
