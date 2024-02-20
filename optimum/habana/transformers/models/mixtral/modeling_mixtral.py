@@ -206,14 +206,10 @@ def gaudi_mixtral_attn_forward(
 def gaudi_mixtral_block_sparse_top2_mlp_forward(self, hidden_states, routing_weights):
     current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
     current_hidden_states = self.w2(current_hidden_states)
-    return current_hidden_states.unsqueeze(-1) * routing_weights.unsqueeze(1)
+    return current_hidden_states # .unsqueeze(-1) * routing_weights.unsqueeze(1)
 
 
-def gaudi_mixtral_block_sparse_moe_forward(
-    self,
-    hidden_states: torch.Tensor,
-    token_idx: Optional[torch.Tensor] = None
-) -> torch.Tensor:
+def gaudi_mixtral_block_sparse_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
     """ """
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states = hidden_states.view(-1, hidden_dim)
@@ -235,27 +231,21 @@ def gaudi_mixtral_block_sparse_moe_forward(
         (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
     )
 
-    # One hot encode the selected experts to create an expert mask
-    # this will be used to easily index which expert is going to be sollicitated
-    # [num_experts, top_k, seq_len_padded]
-    expert_mask = torch.nn.functional.one_hot(
-        selected_experts.to(torch.bfloat16), num_classes=self.num_experts
-    ).permute(2, 1, 0)
+    padded_weights = torch.zeros(
+        (batch_size * sequence_length, self.num_experts), dtype=hidden_states.dtype, device=hidden_states.device
+    )
+    padded_weights.scatter_(-1, selected_experts, routing_weights)
+    padded_weights = padded_weights.permute(1, 0).unsqueeze(-1)
 
     # Loop over all available experts in the model and perform the computation on each expert
     for expert_idx in range(self.num_experts):
         # htcore.mark_step()
         # htcore.hpu.current_stream().synchronize()
         expert_layer = self.experts[expert_idx]
-
+        padded_weight = padded_weights[expert_idx]
         current_state_static = hidden_states.reshape(-1, hidden_dim)
-        current_hidden_states_static = expert_layer(current_state_static, routing_weights)
-        #current_hidden_states_static[top_x_list, :, idx_list] == current_hidden_states
-        mask = expert_mask[expert_idx].transpose(0,1).unsqueeze(1).bool()
-        current_hidden_states_static_blanked = torch.where(mask, current_hidden_states_static, 0)
-        current_hidden_states_static_blanked = torch.sum(current_hidden_states_static_blanked, -1)
-
-        final_hidden_states = final_hidden_states + current_hidden_states_static_blanked
+        current_hidden_states_static = expert_layer(current_state_static, padded_weight) * padded_weight
+        final_hidden_states += current_hidden_states_static
         # htcore.mark_step()
         # htcore.hpu.current_stream().synchronize()
 
