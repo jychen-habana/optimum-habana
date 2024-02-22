@@ -63,7 +63,11 @@ except ImportError:
     print("Not using HPU fused scaled dot-product attention kernel.")
     FusedSDPA = None
 
-from deepspeed import comm as dist
+try:
+    from deepspeed import comm as dist
+except ImportError:
+    print("Not using HPU deepspeed.")
+    dist = None
 
 logger = logging.get_logger(__name__)
 
@@ -216,7 +220,7 @@ def gaudi_mixtral_block_sparse_moe_forward(self, hidden_states: torch.Tensor) ->
     # router_logits: (batch * sequence_length, n_experts)
     router_logits = self.gate(hidden_states)
 
-    if dist.is_initialized():
+    if dist and dist.is_initialized():
         output_tensors = [router_logits.clone() for _ in range(dist.get_world_size())]
         dist.all_gather(output_tensors, router_logits)
         router_logits = torch.cat(output_tensors, dim=1)
@@ -325,6 +329,7 @@ def gaudi_mixtral_decoder_layer_forward(
             "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
         )
 
+    htcore.mark_step()
     residual = hidden_states
 
     hidden_states = self.input_layernorm(hidden_states)
@@ -340,12 +345,14 @@ def gaudi_mixtral_decoder_layer_forward(
         token_idx=token_idx,
     )
     hidden_states = residual + hidden_states
+    htcore.mark_step()
 
     # Fully Connected
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states, router_logits = self.block_sparse_moe(hidden_states)
     hidden_states = residual + hidden_states
+    htcore.mark_step()
 
     outputs = (hidden_states,)
 
