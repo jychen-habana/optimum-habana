@@ -228,7 +228,7 @@ def gaudi_mixtral_block_sparse_moe_forward(self, hidden_states: torch.Tensor) ->
     routing_weights = routing_weights.to(hidden_states.dtype)
 
     final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+        (batch_size, sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
     )
 
     padded_weights = torch.zeros(
