@@ -235,7 +235,8 @@ def gaudi_mixtral_block_sparse_moe_forward(self, hidden_states: torch.Tensor) ->
         (batch_size * sequence_length, self.num_experts), dtype=hidden_states.dtype, device=hidden_states.device
     )
     padded_weights.scatter_(-1, selected_experts, routing_weights)
-    padded_weights = padded_weights.permute(1, 0).unsqueeze(-1)
+    padded_weights = padded_weights.reshape(-1, sequence_length, self.num_experts)
+    padded_weights = padded_weights.permute(2, 0, 1).unsqueeze(-1)
 
     # Loop over all available experts in the model and perform the computation on each expert
     for expert_idx in range(self.num_experts):
@@ -244,12 +245,12 @@ def gaudi_mixtral_block_sparse_moe_forward(self, hidden_states: torch.Tensor) ->
         expert_layer = self.experts[expert_idx]
         padded_weight = padded_weights[expert_idx]
         current_state_static = hidden_states.reshape(-1, hidden_dim)
-        current_hidden_states_static = expert_layer(current_state_static, padded_weight) * padded_weight
+        current_hidden_states_static = expert_layer(current_state_static, padded_weight).reshape(-1, sequence_length, hidden_dim) * padded_weight
         final_hidden_states += current_hidden_states_static
         # htcore.mark_step()
         # htcore.hpu.current_stream().synchronize()
 
-    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    # final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     return final_hidden_states, router_logits
 
 
