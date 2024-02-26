@@ -18,32 +18,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-""" PyTorch Mistral model."""
+""" PyTorch Mixtral model."""
 import math
-import token
+import warnings
 from typing import List, Optional, Tuple, Union
 
+import habana_frameworks.torch.core as htcore
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    MoeCausalLMOutputWithPast,
-    MoeModelOutputWithPast
-)
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from transformers.models.mixtral.modeling_mixtral import (
-    MixtralForCausalLM, 
-    load_balancing_loss_func, 
-    apply_rotary_pos_emb, 
-    repeat_kv
+    MixtralForCausalLM,
+    apply_rotary_pos_emb,
+    load_balancing_loss_func,
 )
 from transformers.utils import logging
+
 
 try:
     from habana_frameworks.torch.hpex.kernels import RotaryPosEmbeddingHelperV2 as FusedRoPE
@@ -71,31 +68,117 @@ except ImportError:
 
 logger = logging.get_logger(__name__)
 
-import habana_frameworks.torch.core as htcore
+
+def update(prev, cur, dim, idx, inp_seq_len):
+    orig_cur = cur
+    if prev.dtype == torch.float8_e4m3fn:
+        from habana_frameworks.torch.hpex.kernels.Fp8Ops import cast_to_fp8_v2
+
+        cur = cast_to_fp8_v2(cur, None, False, False, prev.dtype)[0]
+    if cur.shape[2] > 1 and cur.shape[2] <= prev.shape[2]:
+        # Initialize
+        prev[:, :, :inp_seq_len, :].copy_(cur)
+        return orig_cur
+    assert cur.shape[2] == 1, f"Cannot update kv-cache. Unsupported shapes. prev:{prev.shape} cur:{cur.shape}"
+    if idx is not None:
+        prev.index_copy_(dim, idx - 1, cur)
+        prev_cast = prev.to(orig_cur.dtype)
+        return prev_cast
+    else:
+        return torch.cat((prev, cur), dim=dim)
 
 
 def apply_customized_rope(q, k, cos, sin, position_ids):
     if q.device.type == "hpu" and FusedRoPE:
-        return FusedRoPE.apply(q, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0), position_ids), FusedRoPE.apply(k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0), position_ids)
+        return FusedRoPE.apply(
+            q, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0), position_ids
+        ), FusedRoPE.apply(k, cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0), position_ids)
     else:
         return apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
 
 def gaudi_mixtral_rmsnorm_forward(self, hidden_states):
     """
-    Copied from MixtralRMSNorm.forward:
+    Copied from MixtralRMSNorm.forward: https://github.com/huggingface/transformers/blob/v4.37.0/src/transformers/models/mixtral/modeling_mixtral.py
     The only differences are:
         - override RMSNorm with Habana fused RMSNorm
     """
     if hidden_states.device.type == "hpu" and FusedRMSNorm:
-        hidden_states = FusedRMSNorm.apply(hidden_states, self.weight, self.variance_epsilon)
-        return hidden_states
+        # mixed dtypes are not good for FusedRMSNorm, both inputs need to have same dtype
+        if hidden_states.dtype != self.weight.dtype:
+            orig_dtype = hidden_states.dtype
+            hidden_states = FusedRMSNorm.apply(hidden_states.to(self.weight.dtype), self.weight, self.variance_epsilon)
+            return hidden_states.to(orig_dtype)
+        else:
+            hidden_states = FusedRMSNorm.apply(hidden_states, self.weight, self.variance_epsilon)
+            return hidden_states
     else:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
+
+
+def gaudi_mixtral_repeat_kv(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    n_rep: int,
+):
+    """
+    Copied from repeat_kv: https://github.com/huggingface/transformers/blob/v4.37.0/src/transformers/models/mixtral/modeling_mixtral.py
+    The only differences are:
+    - Append num_key_value_heads == 1 check as kv states can be broadcasted during matmuls so need to expand and reshape them.
+    - Add new args query_states, key_states, value_states and attention_mask and update the logic for expansion.
+    The query states go from (batch, num_heads, seqlen, head_dim) to (batch, num_key_value_heads, n_rep, seqlen, head_dim)
+    The key/value states go from (batch, num_key_value_heads, seqlen, head_dim) to (batch, num_key_value_heads, 1, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, kv_len, head_dim = key_states.shape
+    if n_rep == 1 or num_key_value_heads == 1:
+        return query_states, key_states, value_states, attention_mask
+
+    new_kv_shape = (batch, num_key_value_heads, 1, kv_len, head_dim)
+    key_states = key_states.reshape(new_kv_shape)
+    value_states = value_states.reshape(new_kv_shape)
+
+    batch, _, q_len, head_dim = query_states.shape
+    new_q_shape = (batch, num_key_value_heads, n_rep, q_len, head_dim)
+    query_states = query_states.reshape(new_q_shape)
+
+    if attention_mask is not None:
+        # Add groups dim and set to 1
+        attention_mask = attention_mask.unsqueeze(1)
+
+    return query_states, key_states, value_states, attention_mask
+
+
+class KVCache(torch.nn.Module):
+    def __init__(self):
+        super(KVCache, self).__init__()
+        self.cache = None
+        self.inp_seq_len = -1
+
+    def allocate(self, inp_seq_len, kv_cache_fp8, dtype, device, shape):
+        if self.cache is None or self.cache.shape != shape:
+            self.inp_seq_len = inp_seq_len
+            if kv_cache_fp8:
+                dtype = torch.float8_e4m3fn
+            self.cache = torch.zeros(shape, dtype=dtype, device=device)
+        else:
+            assert (
+                self.inp_seq_len == inp_seq_len
+            ), f"inp_seq_len must be the same. self.inp_seq_len:{self.inp_seq_len} inp_seq_len:{inp_seq_len}"
+            self.cache.fill_(0)
+
+    def get_shape(self):
+        if self.cache is None:
+            return None
+        return self.cache.shape
+
+    def forward(self, cur, dim, idx):
+        return update(self.cache, cur, dim, idx, self.inp_seq_len)
 
 
 def gaudi_mixtral_attn_forward(
@@ -110,9 +193,10 @@ def gaudi_mixtral_attn_forward(
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     """
-    Copied from MixtralAttention.forward: 
+    Copied from MixtralAttention.forward: https://github.com/huggingface/transformers/blob/v4.37.0/src/transformers/models/mixtral/modeling_mixtral.py
     The only differences are:
     - add new args token_idx
+    - optimize KV cache
     """
     if "padding_mask" in kwargs:
         warnings.warn(
@@ -164,24 +248,15 @@ def gaudi_mixtral_attn_forward(
         if q_len == 1:
             # next token
             with ht.sdp_kernel(enable_recompute=False):
-                attn_output = FusedSDPA.apply(
-                    query_states, key_states, value_states, attention_mask, 0.0, False, None
-                )
+                attn_output = FusedSDPA.apply(query_states, key_states, value_states, attention_mask, 0.0, False, None)
         else:
             # first token
-            with ht.sdp_kernel(enable_recompute=False): # inference: flash_attention_recompute = False
-                attn_output = FusedSDPA.apply(
-                    query_states, key_states, value_states, attention_mask, 0.0, False, None
-                )
+            with ht.sdp_kernel(enable_recompute=False):  # inference: flash_attention_recompute = False
+                attn_output = FusedSDPA.apply(query_states, key_states, value_states, attention_mask, 0.0, False, None)
     else:
-        query_states, key_states, value_states = \
-            query_states.unsqueeze(2), key_states.unsqueeze(2), value_states.unsqueeze(2)
-        query_states = query_states.reshape(bsz, self.num_key_value_heads,
-            self.num_key_value_groups, q_len, self.head_dim).contiguous()
-        key_states = key_states.reshape(bsz, self.num_key_value_heads,
-            1, kv_seq_len, self.head_dim).contiguous()
-        value_states = value_states.reshape(bsz, self.num_key_value_heads,
-            1, kv_seq_len, self.head_dim).contiguous()
+        query_states, key_states, value_states, attention_mask = gaudi_mixtral_repeat_kv(
+            query_states, key_states, value_states, attention_mask, self.num_key_value_groups
+        )
 
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
@@ -207,14 +282,12 @@ def gaudi_mixtral_attn_forward(
     return attn_output, attn_weights, past_key_value
 
 
-def gaudi_mixtral_block_sparse_top2_mlp_forward(self, hidden_states, routing_weights):
-    current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
-    current_hidden_states = self.w2(current_hidden_states)
-    return current_hidden_states # .unsqueeze(-1) * routing_weights.unsqueeze(1)
-
-
 def gaudi_mixtral_block_sparse_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    """ """
+    """
+    Copied from MixtralSparseMoeBlock.forward: https://github.com/huggingface/transformers/blob/v4.37.0/src/transformers/models/mixtral/modeling_mixtral.py
+    The only differences are:
+    - optimize expert forward, remove dynamic control and dynamic shape
+    """
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states = hidden_states.view(-1, hidden_dim)
     # router_logits: (batch * sequence_length, n_experts)
@@ -244,67 +317,15 @@ def gaudi_mixtral_block_sparse_moe_forward(self, hidden_states: torch.Tensor) ->
 
     # Loop over all available experts in the model and perform the computation on each expert
     for expert_idx in range(self.num_experts):
-        # htcore.mark_step()
-        # htcore.hpu.current_stream().synchronize()
         expert_layer = self.experts[expert_idx]
         padded_weight = padded_weights[expert_idx]
         current_state_static = hidden_states.reshape(-1, hidden_dim)
-        current_hidden_states_static = expert_layer(current_state_static, padded_weight).reshape(-1, sequence_length, hidden_dim) * padded_weight
+        current_hidden_states_static = (
+            expert_layer(current_state_static).reshape(-1, sequence_length, hidden_dim) * padded_weight
+        )
         final_hidden_states += current_hidden_states_static
-        # htcore.mark_step()
-        # htcore.hpu.current_stream().synchronize()
 
-    # final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     return final_hidden_states, router_logits
-
-
-'''
-# transformers>=4.36.0
-def gaudi_mixtral_block_sparse_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    """ """
-    batch_size, sequence_length, hidden_dim = hidden_states.shape
-    hidden_states = hidden_states.view(-1, hidden_dim)
-    # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
-
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    # we cast back to the input dtype
-    routing_weights = routing_weights.to(hidden_states.dtype)
-
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
-    )
-
-    # One hot encode the selected experts to create an expert mask
-    # this will be used to easily index which expert is going to be sollicitated
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-    # Loop over all available experts in the model and perform the computation on each expert
-    for expert_idx in range(self.num_experts):
-        expert_layer = self.experts[expert_idx]
-        idx, top_x = torch.where(expert_mask[expert_idx])
-
-        if top_x.shape[0] == 0:
-            continue
-
-        # in torch it is faster to index using lists than torch tensors
-        top_x_list = top_x.tolist()
-        idx_list = idx.tolist()
-
-        # Index the correct hidden states and compute the expert hidden state for
-        # the current expert. We need to make sure to multiply the output hidden
-        # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-        current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-        current_hidden_states = expert_layer(current_state, routing_weights[top_x_list, idx_list, None])
-
-        # However `index_add_` only support torch tensors for indexing so we'll use
-        # the `top_x` tensor here.
-        final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-    final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-    return final_hidden_states, router_logits
-'''
 
 
 def gaudi_mixtral_decoder_layer_forward(
@@ -320,7 +341,7 @@ def gaudi_mixtral_decoder_layer_forward(
     **kwargs,
 ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
     """
-    Copied from MixtralDecoderLayer.forward:
+    Copied from MixtralDecoderLayer.forward: https://github.com/huggingface/transformers/blob/v4.37.0/src/transformers/models/mixtral/modeling_mixtral.py
     The only differences are:
     - add new args token_idx
     """
@@ -383,7 +404,7 @@ def gaudi_mixtral_model_forward(
     token_idx: Optional[torch.Tensor] = None,
 ) -> Union[Tuple, MoeModelOutputWithPast]:
     """
-    Copied from MixtralModel.forward: 
+    Copied from MixtralModel.forward: https://github.com/huggingface/transformers/blob/v4.37.0/src/transformers/models/mixtral/modeling_mixtral.py#L1069
     The only differences are:
     - add new args token_idx
     """
@@ -539,22 +560,14 @@ def gaudi_mixtral_model_forward(
 
 
 class GaudiMixtralForCausalLM(MixtralForCausalLM):
-    '''
-    def __init__(self, config):
-        super().__init__(config)
-        import habana_frameworks.torch as ht
-        # # 36.66 tokens/second
-        self.model = ht.hpu.wrap_in_hpu_graph(self.model)
-
-        # # 6.21 tokens/second
-        # self.model.embed_tokens = ht.hpu.wrap_in_hpu_graph(self.model.embed_tokens)
-        # for layer_idx in range(config.num_hidden_layers):
-        #     self.model.layers[layer_idx].self_attn = ht.hpu.wrap_in_hpu_graph(self.model.layers[layer_idx].self_attn)
-        #     # self.model.layers[layer_idx].block_sparse_moe = ht.hpu.wrap_in_hpu_graph(self.model.layers[layer_idx].block_sparse_moe)
-        #     self.model.layers[layer_idx].input_layernorm = ht.hpu.wrap_in_hpu_graph(self.model.layers[layer_idx].input_layernorm)
-        #     self.model.layers[layer_idx].post_attention_layernorm = ht.hpu.wrap_in_hpu_graph(self.model.layers[layer_idx].post_attention_layernorm)
-        # self.model.norm = ht.hpu.wrap_in_hpu_graph(self.model.norm)
-    '''
+    """
+    Inherits from MixtralForCausalLM: https://github.com/huggingface/transformers/blob/v4.37.0/src/transformers/models/mixtral/modeling_mixtral.py#L1231
+    The only differences are:
+    - add new args token_idx
+    - add token_idx into model_inputs
+    - from step2 when enable KV cache, slice next_input_ids from input_ids base on the token_idx
+    - from step2 when enable KV cache, slice next_position_ids from position_ids base on the token_idx
+    """
 
     def forward(
         self,
@@ -571,12 +584,6 @@ class GaudiMixtralForCausalLM(MixtralForCausalLM):
         return_dict: Optional[bool] = None,
         token_idx: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
-        """
-        Inherits from MixtralForCausalLM: 
-        The only differences are:
-        - add new args token_idx
-        """
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
@@ -646,14 +653,6 @@ class GaudiMixtralForCausalLM(MixtralForCausalLM):
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        """
-        Inherits from MistralForCausalLM: https://github.com/huggingface/transformers/blob/v4.34.1/src/transformers/models/mistral/modeling_mistral.py
-        The only differences are:
-        - add new args token_idx
-        - add token_idx into model_inputs
-        - from step2 when enable KV cache, slice next_input_ids from input_ids base on the token_idx
-        - from step2 when enable KV cache, slice next_position_ids from position_ids base on the token_idx
-        """
         token_idx = kwargs.get("token_idx", None)
 
         if past_key_values:
