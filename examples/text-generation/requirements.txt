@@ -1,3 +1,2 @@
 datasets
 peft
-transformers==4.36.0
