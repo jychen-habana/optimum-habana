@@ -87,8 +87,8 @@ def incrementor(bucket_size, prompt_len):
         if passnum == 0:
             token_idx = prompt_len
             allocated_space = int(math.ceil(prompt_len / bucket_size) * bucket_size)
-            if prompt_len % bucket_size == 0:
-                allocated_space += bucket_size
+            # if prompt_len % bucket_size == 0:
+            #     allocated_space += bucket_size
             need_expansion = True
         else:
             token_idx += 1
